@@ -60,7 +60,7 @@ def get_responsible_with_kpis(responsible_id, week):
             # Fetch responsible info
             cur.execute(
                 """
-                SELECT responsible_id, name, email, plant_name
+                SELECT responsible_id, name, email
                 FROM public."Responsible"
                 WHERE responsible_id = %s
                 """,
@@ -89,7 +89,6 @@ def get_responsible_with_kpis(responsible_id, week):
                     'responsible_id': responsible[0],
                     'name': responsible[1],
                     'email': responsible[2],
-                    'plant_name': responsible[3],
                 },
                 'kpis': [
                     {
@@ -447,7 +446,6 @@ def form_page():
                         </div>
                         <div class="info-row">
                             <div class="info-label">Plant</div>
-                            <div class="info-value">{responsible['plant_name']}</div>
                         </div>
                         <div class="info-row">
                             <div class="info-label">Week</div>
