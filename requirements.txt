@@ -1,0 +1,7 @@
+Flask
+Flask-CORS
+psycopg2-binary
+python-dotenv
+APScheduler
+apscheduler 
+pytz
