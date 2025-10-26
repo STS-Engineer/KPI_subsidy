@@ -10,6 +10,10 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import pytz
 import traceback
 from urllib.parse import quote_plus
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 app = Flask(__name__)
 
@@ -19,19 +23,19 @@ PORT = int(os.getenv('PORT', 5000))
 # ---------- PostgreSQL Connection Pool ----------
 db_pool = pool.SimpleConnectionPool(
     1, 20,
-    user="administrationSTS",
-    host="avo-adb-002.postgres.database.azure.com",
-    database="Subsidy_DB",
-    password="St$@0987",
-    port=5432,
+    user=os.getenv('DB_USER', "administrationSTS"),
+    host=os.getenv('DB_HOST', "avo-adb-002.postgres.database.azure.com"),
+    database=os.getenv('DB_NAME', "Subsidy_DB"),
+    password=os.getenv('DB_PASSWORD', "St$@0987"),
+    port=int(os.getenv('DB_PORT', 5432)),
     sslmode="require"
 )
 
 # ---------- Email Configuration ----------
-SMTP_SERVER = "avocarbon-com.mail.protection.outlook.com"
-SMTP_PORT = 25
-EMAIL_USER = "administration.STS@avocarbon.com"
-EMAIL_PASSWORD = "shnlgdyfbcztbhxn"
+SMTP_SERVER = os.getenv('EMAIL_HOST', "smtp.office365.com")
+SMTP_PORT = int(os.getenv('EMAIL_PORT', 587))
+EMAIL_USER = os.getenv('EMAIL_USER', "administration.STS@avocarbon.com")
+EMAIL_PASSWORD = os.getenv('EMAIL_PASS', "shnlgdyfbcztbhxn")
 
 # ========================================
 # HELPER FUNCTIONS
@@ -150,7 +154,13 @@ def send_kpi_email(responsible_id, responsible_name, responsible_email, kpi_name
         """
         msg.attach(MIMEText(html_content, 'html'))
 
+        # Use authenticated SMTP with TLS encryption
+        print(f"📧 Connecting to {SMTP_SERVER}:{SMTP_PORT}...")
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10) as server:
+            server.starttls()  # Enable TLS encryption
+            print(f"🔐 Starting TLS encryption...")
+            server.login(EMAIL_USER, EMAIL_PASSWORD)  # Authenticate with credentials
+            print(f"✅ Authenticated as {EMAIL_USER}")
             server.send_message(msg)
 
         print(f"✅ Email sent successfully to {responsible_email} for KPI: {kpi_name}")
@@ -343,6 +353,7 @@ def home():
                 <div class="info"><span class="label">Current Week:</span> {get_current_iso_week()}</div>
                 <div class="info"><span class="label">Next Scheduled Check:</span> {next_run}</div>
                 <div class="info"><span class="label">Server Time:</span> {datetime.now()}</div>
+                <div class="info"><span class="label">Email Server:</span> {SMTP_SERVER}:{SMTP_PORT}</div>
             </div>
             <p>The system automatically checks for due KPIs and sends email notifications to responsible parties based on the <code>frequence_de_envoi</code> schedule.</p>
         </div>
@@ -443,9 +454,6 @@ def form_page():
                         <div class="info-row">
                             <div class="info-label">Responsible</div>
                             <div class="info-value">{responsible['name']}</div>
-                        </div>
-                        <div class="info-row">
-                            <div class="info-label">Plant</div>
                         </div>
                         <div class="info-row">
                             <div class="info-label">Week</div>
@@ -577,8 +585,8 @@ scheduler = BackgroundScheduler(timezone=pytz.timezone('Africa/Tunis'))
 scheduler.add_job(
     scheduled_email_task,
     'cron',
-    hour=23,
-    minute=10,  
+    hour=10,
+    minute=15,
     timezone=pytz.timezone('Africa/Tunis'),
     id='kpi_email_scheduler',
     name='KPI Automated Email Scheduler'
@@ -589,7 +597,8 @@ print("\n" + "="*70)
 print("✅ KPI AUTOMATION SYSTEM INITIALIZED")
 print("="*70)
 print(f"📅 Scheduler: Active")
-print(f"⏰ Schedule: Daily at 8:00 AM (Africa/Tunis)")
+print(f"⏰ Schedule: Daily at 10:15 AM (Africa/Tunis)")
+print(f"📧 Email Server: {SMTP_SERVER}:{SMTP_PORT} (Authenticated SMTP)")
 print(f"📧 Next run: {scheduler.get_jobs()[0].next_run_time}")
 print(f"🌐 Server: Running on port {PORT}")
 print("="*70 + "\n")
