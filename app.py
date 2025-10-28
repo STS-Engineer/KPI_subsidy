@@ -57,12 +57,13 @@ def get_responsible_with_kpis(responsible_id, week):
     conn = db_pool.getconn()
     try:
         with conn.cursor() as cur:
-            # Fetch responsible info
+            # Fetch responsible info with plant name
             cur.execute(
                 """
-                SELECT responsible_id, name, email
-                FROM public."Responsible"
-                WHERE responsible_id = %s
+                SELECT r.responsible_id, r.name, r.email, p.name as plant_name
+                FROM public."Responsible" r
+                LEFT JOIN public.plants p ON r.plant_id = p.plant_id
+                WHERE r.responsible_id = %s
                 """,
                 (responsible_id,),
             )
@@ -89,6 +90,7 @@ def get_responsible_with_kpis(responsible_id, week):
                     'responsible_id': responsible[0],
                     'name': responsible[1],
                     'email': responsible[2],
+                    'plant_name': responsible[3] or 'N/A',
                 },
                 'kpis': [
                     {
@@ -110,7 +112,58 @@ def get_responsible_with_kpis(responsible_id, week):
     finally:
         db_pool.putconn(conn)
 
-def send_kpi_email(responsible_id, responsible_name, responsible_email, kpi_name, week):
+def get_all_kpi_values():
+    """Fetch all KPI values with responsible, plant, and KPI details"""
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 
+                    kv.kpi_values_id,
+                    r.responsible_id,
+                    r.name as responsible_name,
+                    p.name as plant_name,
+                    k.kpi_id,
+                    k."KPI_name",
+                    kv.value,
+                    kv.week,
+                    kv.analyse,
+                    kv.actions_correctives,
+                    k."KPI_objectif"
+                FROM public.kpi_values kv
+                JOIN public."Responsible" r ON kv.responsible_id = r.responsible_id
+                LEFT JOIN public.plants p ON r.plant_id = p.plant_id
+                JOIN public."Kpi" k ON kv.kpi_id = k.kpi_id
+                ORDER BY kv.week DESC, r.name ASC, k."KPI_name" ASC
+                """
+            )
+            results = cur.fetchall()
+            
+            return [
+                {
+                    'kpi_values_id': row[0],
+                    'responsible_id': row[1],
+                    'responsible_name': row[2],
+                    'plant_name': row[3] or 'N/A',
+                    'kpi_id': row[4],
+                    'kpi_name': row[5],
+                    'value': row[6],
+                    'week': row[7],
+                    'analyse': row[8],
+                    'actions_correctives': row[9],
+                    'kpi_objectif': row[10]
+                }
+                for row in results
+            ]
+    except Exception as e:
+        print(f"❌ Database error in get_all_kpi_values: {str(e)}")
+        traceback.print_exc()
+        return []
+    finally:
+        db_pool.putconn(conn)
+
+def send_kpi_email(responsible_id, responsible_name, responsible_email, kpi_name, week, plant_name):
     """Send KPI email with a link to the form for a specific responsible"""
     try:
         base = _base_url()
@@ -119,7 +172,7 @@ def send_kpi_email(responsible_id, responsible_name, responsible_email, kpi_name
         msg = MIMEMultipart()
         msg['From'] = f'"Administration STS" <{EMAIL_USER}>'
         msg['To'] = responsible_email
-        msg['Subject'] = f"KPI Report - {kpi_name} - Week {week}"
+        msg['Subject'] = f"KPI Report - {kpi_name} - {plant_name} - Week {week}"
 
         html_content = f"""
         <!DOCTYPE html>
@@ -128,11 +181,11 @@ def send_kpi_email(responsible_id, responsible_name, responsible_email, kpi_name
           <div style="max-width:640px;margin:0 auto;background:#fff;border-radius:8px;overflow:hidden;border:1px solid #eee">
             <div style="background:#0078D7;color:#fff;padding:20px 24px">
               <h2 style="margin:0;font-weight:600">KPI Report – {responsible_name}</h2>
-              <div style="margin-top:8px;font-size:14px">Week {week}</div>
+              <div style="margin-top:8px;font-size:14px">Week {week} | {plant_name}</div>
             </div>
             <div style="padding:24px">
               <p>Hello {responsible_name},</p>
-              <p>The KPI <strong>{kpi_name}</strong> is due for reporting for week <strong>{week}</strong>.</p>
+              <p>The KPI <strong>{kpi_name}</strong> for <strong>{plant_name}</strong> is due for reporting for week <strong>{week}</strong>.</p>
               <p>Please click the link below to fill out your KPI analysis and corrective actions:</p>
               <p style="text-align:center;margin:28px 0">
                 <a href="{form_link}"
@@ -167,9 +220,9 @@ def send_kpi_email(responsible_id, responsible_name, responsible_email, kpi_name
 
 def get_due_kpis_with_responsibles():
     """
-    Fetch all KPIs that are due (frequence_de_envoi <= NOW) 
+    Fetch all KPIs that are due (frequence_de_envoi <= NOW()) 
     along with their assigned responsibles for the current week.
-    Returns: List of tuples (kpi_id, kpi_name, responsible_id, resp_name, email, week)
+    Returns: List of tuples (kpi_id, kpi_name, responsible_id, resp_name, email, week, plant_name)
     """
     conn = db_pool.getconn()
     current_week = get_current_iso_week()
@@ -184,10 +237,12 @@ def get_due_kpis_with_responsibles():
                     r.responsible_id,
                     r.name,
                     r.email,
-                    kv.week
+                    kv.week,
+                    COALESCE(p.name, 'N/A') as plant_name
                 FROM public."Kpi" k
                 JOIN public.kpi_values kv ON kv.kpi_id = k.kpi_id
                 JOIN public."Responsible" r ON r.responsible_id = kv.responsible_id
+                LEFT JOIN public.plants p ON r.plant_id = p.plant_id
                 WHERE k.frequence_de_envoi <= NOW()
                   AND kv.week = %s
                 ORDER BY k.kpi_id, r.responsible_id
@@ -275,14 +330,15 @@ def scheduled_email_task():
     print(f"\n📧 Processing {len(due_records)} KPI-Responsible combination(s):\n")
 
     # Send email to each responsible for their due KPIs
-    for kpi_id, kpi_name, responsible_id, resp_name, email, week in due_records:
+    for kpi_id, kpi_name, responsible_id, resp_name, email, week, plant_name in due_records:
         print(f"📤 Sending KPI reminder:")
         print(f"   KPI: {kpi_name} (ID: {kpi_id})")
         print(f"   To: {resp_name} ({email})")
+        print(f"   Plant: {plant_name}")
         print(f"   Week: {week}")
 
         try:
-            success = send_kpi_email(responsible_id, resp_name, email, kpi_name, week)
+            success = send_kpi_email(responsible_id, resp_name, email, kpi_name, week, plant_name)
 
             if success:
                 emails_sent += 1
@@ -333,6 +389,8 @@ def home():
             .status {{ background: #e7f3ff; padding: 15px; border-radius: 5px; margin: 20px 0; border-left: 4px solid #0078D7; }}
             .info {{ margin: 10px 0; }}
             .label {{ font-weight: 600; color: #333; }}
+            .button {{ display: inline-block; margin-top: 20px; padding: 12px 24px; background: #0078D7; color: white; text-decoration: none; border-radius: 6px; font-weight: 600; transition: background 0.2s; }}
+            .button:hover {{ background: #005ea6; }}
         </style>
     </head>
     <body>
@@ -345,14 +403,296 @@ def home():
                 <div class="info"><span class="label">Server Time:</span> {datetime.now()}</div>
             </div>
             <p>The system automatically checks for due KPIs and sends email notifications to responsible parties based on the <code>frequence_de_envoi</code> schedule.</p>
+            <a href="/dashboard" class="button">📊 View Dashboard</a>
         </div>
     </body>
     </html>
     '''
 
+@app.route('/dashboard')
+def dashboard():
+    """Display KPI values dashboard with expanded text view"""
+    try:
+        kpi_data = get_all_kpi_values()
+        
+        if not kpi_data:
+            return '''
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <title>KPI Dashboard</title>
+                <style>
+                    body { font-family: 'Segoe UI', sans-serif; background: #f4f6f9; padding: 40px; }
+                    .container { max-width: 1200px; margin: 0 auto; background: #fff; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                    h1 { color: #0078D7; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>📊 KPI Dashboard</h1>
+                    <p>No KPI data available.</p>
+                    <a href="/" style="color: #0078D7;">← Back to Home</a>
+                </div>
+            </body>
+            </html>
+            '''
+        
+        # Generate table rows
+        rows_html = ""
+        for item in kpi_data:
+            # Escape HTML in text content
+            analyse_text = (item['analyse'] or 'N/A').replace('<', '&lt;').replace('>', '&gt;')
+            actions_text = (item['actions_correctives'] or 'N/A').replace('<', '&lt;').replace('>', '&gt;')
+            
+            rows_html += f'''
+            <tr>
+                <td>{item['kpi_values_id']}</td>
+                <td>{item['responsible_name']}</td>
+                <td><strong>{item['plant_name']}</strong></td>
+                <td>{item['kpi_name']}</td>
+                <td>{item['value'] or 'N/A'}</td>
+                <td>{item['week']}</td>
+                <td class="text-cell">
+                    <div class="text-preview">{analyse_text[:100]}{'' if len(analyse_text) <= 100 else '...'}</div>
+                    <button class="view-btn" onclick="showFullText('Analyse - {item['kpi_name']}', `{analyse_text}`)">View Full</button>
+                </td>
+                <td class="text-cell">
+                    <div class="text-preview">{actions_text[:100]}{'' if len(actions_text) <= 100 else '...'}</div>
+                    <button class="view-btn" onclick="showFullText('Actions Correctives - {item['kpi_name']}', `{actions_text}`)">View Full</button>
+                </td>
+            </tr>
+            '''
+        
+        return f'''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <title>KPI Dashboard</title>
+            <style>
+                body {{
+                    font-family: 'Segoe UI', sans-serif;
+                    background: #f4f6f9;
+                    padding: 20px;
+                    margin: 0;
+                }}
+                .container {{
+                    max-width: 1600px;
+                    margin: 0 auto;
+                    background: #fff;
+                    padding: 30px;
+                    border-radius: 10px;
+                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                }}
+                .header {{
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    margin-bottom: 30px;
+                    padding-bottom: 20px;
+                    border-bottom: 2px solid #0078D7;
+                }}
+                h1 {{
+                    color: #0078D7;
+                    margin: 0;
+                }}
+                .back-link {{
+                    color: #0078D7;
+                    text-decoration: none;
+                    font-weight: 600;
+                    padding: 10px 20px;
+                    border: 2px solid #0078D7;
+                    border-radius: 6px;
+                    transition: all 0.2s;
+                }}
+                .back-link:hover {{
+                    background: #0078D7;
+                    color: white;
+                }}
+                .stats {{
+                    background: #e7f3ff;
+                    padding: 15px;
+                    border-radius: 6px;
+                    margin-bottom: 20px;
+                    border-left: 4px solid #0078D7;
+                }}
+                .table-wrapper {{
+                    overflow-x: auto;
+                    border: 1px solid #ddd;
+                    border-radius: 6px;
+                }}
+                table {{
+                    width: 100%;
+                    border-collapse: collapse;
+                    min-width: 1400px;
+                }}
+                thead {{
+                    background: #0078D7;
+                    color: white;
+                }}
+                th {{
+                    padding: 12px;
+                    text-align: left;
+                    font-weight: 600;
+                    position: sticky;
+                    top: 0;
+                    background: #0078D7;
+                }}
+                td {{
+                    padding: 12px;
+                    border-bottom: 1px solid #eee;
+                    vertical-align: top;
+                }}
+                tr:hover {{
+                    background: #f8f9fa;
+                }}
+                .text-cell {{
+                    max-width: 300px;
+                }}
+                .text-preview {{
+                    margin-bottom: 8px;
+                    line-height: 1.4;
+                    color: #333;
+                }}
+                .view-btn {{
+                    background: #0078D7;
+                    color: white;
+                    border: none;
+                    padding: 6px 12px;
+                    border-radius: 4px;
+                    cursor: pointer;
+                    font-size: 12px;
+                    transition: background 0.2s;
+                }}
+                .view-btn:hover {{
+                    background: #005ea6;
+                }}
+                
+                /* Modal styles */
+                .modal {{
+                    display: none;
+                    position: fixed;
+                    z-index: 1000;
+                    left: 0;
+                    top: 0;
+                    width: 100%;
+                    height: 100%;
+                    background-color: rgba(0,0,0,0.5);
+                }}
+                .modal-content {{
+                    background-color: #fff;
+                    margin: 5% auto;
+                    padding: 30px;
+                    border-radius: 10px;
+                    width: 80%;
+                    max-width: 800px;
+                    max-height: 70vh;
+                    overflow-y: auto;
+                    box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+                }}
+                .modal-header {{
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    margin-bottom: 20px;
+                    padding-bottom: 15px;
+                    border-bottom: 2px solid #0078D7;
+                }}
+                .modal-header h2 {{
+                    color: #0078D7;
+                    margin: 0;
+                }}
+                .close {{
+                    color: #aaa;
+                    font-size: 32px;
+                    font-weight: bold;
+                    cursor: pointer;
+                    line-height: 1;
+                }}
+                .close:hover {{
+                    color: #000;
+                }}
+                .modal-body {{
+                    white-space: pre-wrap;
+                    line-height: 1.6;
+                    color: #333;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>📊 KPI Values Dashboard</h1>
+                    <a href="/" class="back-link">← Back to Home</a>
+                </div>
+                
+                <div class="stats">
+                    <strong>Total Records:</strong> {len(kpi_data)}
+                </div>
+                
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Responsible</th>
+                                <th>Plant</th>
+                                <th>KPI Name</th>
+                                <th>Value</th>
+                                <th>Week</th>
+                                <th>Analysis</th>
+                                <th>Corrective Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {rows_html}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <!-- Modal -->
+            <div id="textModal" class="modal">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h2 id="modalTitle"></h2>
+                        <span class="close" onclick="closeModal()">&times;</span>
+                    </div>
+                    <div id="modalBody" class="modal-body"></div>
+                </div>
+            </div>
+            
+            <script>
+                function showFullText(title, text) {{
+                    document.getElementById('modalTitle').textContent = title;
+                    document.getElementById('modalBody').textContent = text;
+                    document.getElementById('textModal').style.display = 'block';
+                }}
+                
+                function closeModal() {{
+                    document.getElementById('textModal').style.display = 'none';
+                }}
+                
+                window.onclick = function(event) {{
+                    const modal = document.getElementById('textModal');
+                    if (event.target == modal) {{
+                        modal.style.display = 'none';
+                    }}
+                }}
+            </script>
+        </body>
+        </html>
+        '''
+        
+    except Exception as e:
+        print(f"❌ Error in dashboard: {str(e)}")
+        traceback.print_exc()
+        return f'<p style="color:red; padding: 20px;">Error loading dashboard: {str(e)}</p>'
+
 @app.route('/form')
 def form_page():
-    """Display KPI form"""
+    """Display KPI form with plant name"""
     try:
         responsible_id = request.args.get('responsible_id')
         week = request.args.get('week', get_current_iso_week())
@@ -363,7 +703,7 @@ def form_page():
         responsible = data['responsible']
         kpis = data['kpis']
 
-        print(f"📋 Data loaded - Responsible: {responsible['name']}, KPIs: {len(kpis)}")
+        print(f"📋 Data loaded - Responsible: {responsible['name']}, Plant: {responsible['plant_name']}, KPIs: {len(kpis)}")
 
         if not kpis:
             return '''
@@ -393,13 +733,13 @@ def form_page():
                 </div>
 
                 <div class="form-group">
-                    <label class="form-label">Analysis:</label>
-                    <textarea name="analyse_{kpi['kpi_values_id']}" placeholder="Enter your analysis here..." class="kpi-textarea">{kpi['analyse'] or ''}</textarea>
+                    <label class="form-label">Analysis: <span style="color:#999;font-weight:normal;font-size:12px;">(Provide detailed analysis)</span></label>
+                    <textarea name="analyse_{kpi['kpi_values_id']}" placeholder="Enter your detailed analysis here..." class="kpi-textarea-large">{kpi['analyse'] or ''}</textarea>
                 </div>
 
                 <div class="form-group">
-                    <label class="form-label">Corrective Actions:</label>
-                    <textarea name="actions_{kpi['kpi_values_id']}" placeholder="Enter corrective actions..." class="kpi-textarea">{kpi['actions_correctives'] or ''}</textarea>
+                    <label class="form-label">Corrective Actions: <span style="color:#999;font-weight:normal;font-size:12px;">(Provide detailed corrective actions)</span></label>
+                    <textarea name="actions_{kpi['kpi_values_id']}" placeholder="Enter detailed corrective actions here..." class="kpi-textarea-large">{kpi['actions_correctives'] or ''}</textarea>
                 </div>
             </div>
             '''
@@ -412,44 +752,46 @@ def form_page():
             <title>KPI Form - Week {week}</title>
             <style>
                 body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f6f9; padding: 20px; margin: 0; }}
-                .container {{ max-width: 900px; margin: 0 auto; background: #fff; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); overflow: hidden; }}
-                .header {{ background: #0078D7; color: white; padding: 20px; text-align: center; }}
-                .header h1 {{ margin: 0; font-size: 24px; font-weight: 600; }}
+                .container {{ max-width: 1000px; margin: 0 auto; background: #fff; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); overflow: hidden; }}
+                .header {{ background: #0078D7; color: white; padding: 25px; text-align: center; }}
+                .header h1 {{ margin: 0; font-size: 26px; font-weight: 600; }}
+                .header .subtitle {{ margin-top: 8px; font-size: 14px; opacity: 0.9; }}
                 .form-section {{ padding: 30px; }}
                 .info-section {{ background: #f8f9fa; padding: 20px; border-radius: 6px; margin-bottom: 25px; border-left: 4px solid #0078D7; }}
                 .info-row {{ display: flex; margin-bottom: 15px; align-items: center; }}
-                .info-label {{ font-weight: 600; color: #333; width: 120px; font-size: 14px; }}
-                .info-value {{ flex: 1; padding: 8px 12px; background: white; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }}
+                .info-label {{ font-weight: 600; color: #333; width: 140px; font-size: 14px; }}
+                .info-value {{ flex: 1; padding: 10px 12px; background: white; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }}
                 .kpi-section {{ margin-top: 30px; }}
-                .kpi-section h3 {{ color: #0078D7; margin-bottom: 20px; font-size: 18px; border-bottom: 2px solid #0078D7; padding-bottom: 8px; }}
-                .kpi-card {{ background: #fff; border: 1px solid #e1e5e9; border-radius: 6px; padding: 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }}
-                .form-group {{ margin-bottom: 15px; }}
-                .form-label {{ display: block; font-weight: 600; color: #333; margin-bottom: 5px; font-size: 14px; }}
-                .kpi-input {{ width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; transition: border-color 0.2s; }}
-                .kpi-textarea {{ width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; min-height: 80px; resize: vertical; transition: border-color 0.2s; font-family: inherit; }}
-                .kpi-input:focus, .kpi-textarea:focus {{ border-color: #0078D7; outline: none; box-shadow: 0 0 0 2px rgba(0,120,215,0.1); }}
-                .submit-btn {{ background: #0078D7; color: white; border: none; padding: 12px 30px; border-radius: 4px; font-size: 16px; font-weight: 600; cursor: pointer; transition: background-color 0.2s; display: block; width: 100%; margin-top: 20px; }}
+                .kpi-section h3 {{ color: #0078D7; margin-bottom: 20px; font-size: 20px; border-bottom: 2px solid #0078D7; padding-bottom: 10px; }}
+                .kpi-card {{ background: #fff; border: 1px solid #e1e5e9; border-radius: 6px; padding: 25px; margin-bottom: 25px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }}
+                .form-group {{ margin-bottom: 18px; }}
+                .form-label {{ display: block; font-weight: 600; color: #333; margin-bottom: 6px; font-size: 14px; }}
+                .kpi-input {{ width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; transition: border-color 0.2s; box-sizing: border-box; }}
+                .kpi-textarea {{ width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; min-height: 100px; resize: vertical; transition: border-color 0.2s; font-family: inherit; box-sizing: border-box; }}
+                .kpi-textarea-large {{ width: 100%; padding: 12px 15px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; min-height: 180px; resize: vertical; transition: border-color 0.2s; font-family: inherit; line-height: 1.6; box-sizing: border-box; }}
+                .kpi-input:focus, .kpi-textarea:focus, .kpi-textarea-large:focus {{ border-color: #0078D7; outline: none; box-shadow: 0 0 0 2px rgba(0,120,215,0.1); }}
+                .submit-btn {{ background: #0078D7; color: white; border: none; padding: 14px 30px; border-radius: 4px; font-size: 16px; font-weight: 600; cursor: pointer; transition: background-color 0.2s; display: block; width: 100%; margin-top: 20px; }}
                 .submit-btn:hover {{ background: #005ea6; }}
+                .dashboard-btn {{ background: #28a745; color: white; border: none; padding: 14px 30px; border-radius: 4px; font-size: 16px; font-weight: 600; cursor: pointer; transition: background-color 0.2s; display: block; width: 100%; margin-top: 10px; text-decoration: none; text-align: center; }}
+                .dashboard-btn:hover {{ background: #218838; }}
+                .char-counter {{ font-size: 12px; color: #666; margin-top: 4px; text-align: right; }}
             </style>
         </head>
         <body>
             <div class="container">
                 <div class="header">
-                    <h1>📊 KPI Submission Form - Week {week}</h1>
+                    <h1>📊 KPI Submission Form</h1>
                 </div>
 
                 <div class="form-section">
                     <div class="info-section">
                         <div class="info-row">
-                            <div class="info-label">Responsible</div>
+                            <div class="info-label">Responsible:</div>
                             <div class="info-value">{responsible['name']}</div>
                         </div>
                         <div class="info-row">
-                            <div class="info-label">Plant</div>
-                        </div>
-                        <div class="info-row">
-                            <div class="info-label">Week</div>
-                            <div class="info-value">{week}</div>
+                            <div class="info-label">Plant:</div>
+                            <div class="info-value">{responsible['plant_name']}</div>
                         </div>
                     </div>
 
@@ -459,11 +801,28 @@ def form_page():
                             <input type="hidden" name="responsible_id" value="{responsible_id}" />
                             <input type="hidden" name="week" value="{week}" />
                             {kpi_html}
-                            <button type="submit" class="submit-btn">Submit KPI Report</button>
+                            <button type="submit" class="submit-btn">📤 Submit KPI Report</button>
                         </form>
                     </div>
                 </div>
             </div>
+            
+            <script>
+                // Add character counters for textareas
+                document.addEventListener('DOMContentLoaded', function() {{
+                    const textareas = document.querySelectorAll('.kpi-textarea-large');
+                    textareas.forEach(textarea => {{
+                        const counter = document.createElement('div');
+                        counter.className = 'char-counter';
+                        counter.textContent = textarea.value.length + ' characters';
+                        textarea.parentNode.appendChild(counter);
+                        
+                        textarea.addEventListener('input', function() {{
+                            counter.textContent = this.value.length + ' characters';
+                        }});
+                    }});
+                }});
+            </script>
         </body>
         </html>
         '''
@@ -540,23 +899,32 @@ def submit_form():
                         height:100vh; margin:0;
                     }}
                     .success-container {{
-                        background:#fff; padding:40px; border-radius:10px;
+                        background:#fff; padding:50px; border-radius:10px;
                         box-shadow:0 4px 15px rgba(0,0,0,0.1); text-align:center;
-                        max-width: 500px;
+                        max-width: 550px;
                     }}
+                    .success-icon {{ font-size: 64px; margin-bottom: 20px; }}
                     h1 {{ color:#28a745; font-size:28px; margin-bottom:20px; }}
-                    p {{ font-size:16px; color:#333; margin-bottom:30px; }}
+                    p {{ font-size:16px; color:#333; margin-bottom:30px; line-height: 1.6; }}
+                    .button-group {{ display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }}
                     a {{ display:inline-block; padding:12px 25px; background:#0078D7;
-                        color:white; text-decoration:none; border-radius:6px; font-weight:bold; }}
-                    a:hover {{ background:#005ea6; }}
+                        color:white; text-decoration:none; border-radius:6px; font-weight:600; 
+                        margin: 5px; transition: all 0.2s; }}
+                    a:hover {{ background:#005ea6; transform: translateY(-2px); }}
+                    a.dashboard {{ background:#28a745; }}
+                    a.dashboard:hover {{ background:#218838; }}
                 </style>
             </head>
             <body>
                 <div class="success-container">
-                    <h1>✅ KPI Report Submitted!</h1>
-                    <p>Your KPI analysis and corrective actions for week <strong>{week}</strong> have been successfully saved.</p>
-                    <p>Thank you for your submission!</p>
-                    <a href="/form?responsible_id={responsible_id}&week={week}">View Form Again</a>
+                    <div class="success-icon">✅</div>
+                    <h1>KPI Report Submitted Successfully!</h1>
+                    <p>Your KPI analysis and corrective actions for week <strong>{week}</strong> have been successfully saved to the system.</p>
+                    <p>Thank you for your timely submission!</p>
+                    <div class="button-group">
+                        <a href="/form?responsible_id={responsible_id}&week={week}">🔄 View Form Again</a>
+                        <a href="/dashboard" class="dashboard">📊 View Dashboard</a>
+                    </div>
                 </div>
             </body>
             </html>
@@ -577,8 +945,8 @@ scheduler = BackgroundScheduler(timezone=pytz.timezone('Africa/Tunis'))
 scheduler.add_job(
     scheduled_email_task,
     'cron',
-    hour=8,
-    minute=45,  # Changed to run at 8:00 AM
+    hour=10,
+    minute=16,
     timezone=pytz.timezone('Africa/Tunis'),
     id='kpi_email_scheduler',
     name='KPI Automated Email Scheduler'
@@ -589,7 +957,7 @@ print("\n" + "="*70)
 print("✅ KPI AUTOMATION SYSTEM INITIALIZED")
 print("="*70)
 print(f"📅 Scheduler: Active")
-print(f"⏰ Schedule: Daily at 8:00 AM (Africa/Tunis)")
+print(f"⏰ Schedule: Daily at 9:00 AM (Africa/Tunis)")
 print(f"📧 Next run: {scheduler.get_jobs()[0].next_run_time}")
 print(f"🌐 Server: Running on port {PORT}")
 print("="*70 + "\n")
@@ -602,7 +970,8 @@ if __name__ == '__main__':
     try:
         print(f"🔗 Access points:")
         print(f"   - Home: http://localhost:{PORT}/")
-        print(f"   - Form: http://localhost:{PORT}/form?responsible_id=1&week=2025-W43")
+        print(f"   - Dashboard: http://localhost:{PORT}/dashboard")
+        print(f"   - Form: http://localhost:{PORT}/form?responsible_id=1&week=2025-W44")
         print("\n" + "="*70 + "\n")
         app.run(host='0.0.0.0', port=PORT, debug=False)
     except KeyboardInterrupt:
@@ -611,3 +980,4 @@ if __name__ == '__main__':
         db_pool.closeall()
         scheduler.shutdown()
         print("✅ Cleanup complete")
+
