@@ -10,22 +10,37 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import pytz
 import traceback
 from urllib.parse import quote_plus
+import logging
+
+# Configure logging for Azure
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
 # ---------- Configuration ----------
-PORT = int(os.getenv('PORT', 5000))
+PORT = int(os.getenv('PORT', 8000))
+APP_BASE_URL = os.getenv('WEBSITE_HOSTNAME', 'kpi-subsidy.azurewebsites.net')
 
 # ---------- PostgreSQL Connection Pool ----------
-db_pool = pool.SimpleConnectionPool(
-    1, 20,
-    user="administrationSTS",
-    host="avo-adb-002.postgres.database.azure.com",
-    database="Subsidy_DB",
-    password="St$@0987",
-    port=5432,
-    sslmode="require"
-)
+try:
+    db_pool = pool.SimpleConnectionPool(
+        1, 20,
+        user="administrationSTS",
+        host="avo-adb-002.postgres.database.azure.com",
+        database="Subsidy_DB",
+        password="St$@0987",
+        port=5432,
+        sslmode="require",
+        connect_timeout=10
+    )
+    logger.info("✅ Database pool initialized successfully")
+except Exception as e:
+    logger.error(f"❌ Failed to initialize database pool: {str(e)}")
+    db_pool = None
 
 # ---------- Email Configuration ----------
 SMTP_SERVER = "avocarbon-com.mail.protection.outlook.com"
@@ -38,24 +53,33 @@ EMAIL_PASSWORD = "shnlgdyfbcztbhxn"
 # ========================================
 
 def _base_url():
-    """Get base URL for email links"""
-    try:
-        if request and request.host_url:
-            return request.host_url.rstrip('/')
-    except RuntimeError:
-        pass
-    return os.getenv('APP_BASE_URL', f'http://localhost:{PORT}')
+    """Get base URL for email links - Azure compatible"""
+    if APP_BASE_URL:
+        return f"https://{APP_BASE_URL}"
+    return f"http://localhost:{PORT}"
 
 def get_current_iso_week():
     """Get current ISO week in format YYYY-Wxx (e.g., 2025-W43)"""
-    now = datetime.now()
+    now = datetime.now(pytz.timezone('Africa/Tunis'))
     iso_calendar = now.isocalendar()
     return f"{iso_calendar[0]}-W{iso_calendar[1]:02d}"
 
+def get_db_connection():
+    """Get database connection with error handling"""
+    if not db_pool:
+        raise Exception("Database pool not initialized")
+    return db_pool.getconn()
+
+def return_db_connection(conn):
+    """Return database connection to pool"""
+    if db_pool and conn:
+        db_pool.putconn(conn)
+
 def get_responsible_with_kpis(responsible_id, week):
     """Fetch responsible info and their KPIs for a given week"""
-    conn = db_pool.getconn()
+    conn = None
     try:
+        conn = get_db_connection()
         with conn.cursor() as cur:
             # Fetch responsible info with plant name
             cur.execute(
@@ -107,15 +131,16 @@ def get_responsible_with_kpis(responsible_id, week):
                 ],
             }
     except Exception as e:
-        print(f"❌ Database error in get_responsible_with_kpis: {str(e)}")
+        logger.error(f"❌ Database error in get_responsible_with_kpis: {str(e)}")
         raise
     finally:
-        db_pool.putconn(conn)
+        return_db_connection(conn)
 
 def get_all_kpi_values():
     """Fetch all KPI values with responsible, plant, and KPI details"""
-    conn = db_pool.getconn()
+    conn = None
     try:
+        conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -157,11 +182,11 @@ def get_all_kpi_values():
                 for row in results
             ]
     except Exception as e:
-        print(f"❌ Database error in get_all_kpi_values: {str(e)}")
+        logger.error(f"❌ Database error in get_all_kpi_values: {str(e)}")
         traceback.print_exc()
         return []
     finally:
-        db_pool.putconn(conn)
+        return_db_connection(conn)
 
 def send_kpi_email(responsible_id, responsible_name, responsible_email, kpi_name, week, plant_name):
     """Send KPI email with a link to the form for a specific responsible"""
@@ -203,14 +228,14 @@ def send_kpi_email(responsible_id, responsible_name, responsible_email, kpi_name
         """
         msg.attach(MIMEText(html_content, 'html'))
 
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10) as server:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=30) as server:
             server.send_message(msg)
 
-        print(f"✅ Email sent successfully to {responsible_email} for KPI: {kpi_name}")
+        logger.info(f"✅ Email sent successfully to {responsible_email} for KPI: {kpi_name}")
         return True
 
     except Exception as e:
-        print(f"❌ Failed to send email to {responsible_email}: {str(e)}")
+        logger.error(f"❌ Failed to send email to {responsible_email}: {str(e)}")
         traceback.print_exc()
         return False
 
@@ -219,15 +244,12 @@ def send_kpi_email(responsible_id, responsible_name, responsible_email, kpi_name
 # ========================================
 
 def get_due_kpis_with_responsibles():
-    """
-    Fetch all KPIs that are due (frequence_de_envoi <= NOW()) 
-    along with their assigned responsibles for the current week.
-    Returns: List of tuples (kpi_id, kpi_name, responsible_id, resp_name, email, week, plant_name)
-    """
-    conn = db_pool.getconn()
+    """Fetch all KPIs that are due for the current week"""
+    conn = None
     current_week = get_current_iso_week()
 
     try:
+        conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -251,23 +273,21 @@ def get_due_kpis_with_responsibles():
             )
 
             results = cur.fetchall()
-            print(f"📊 Found {len(results)} KPI-Responsible combinations due for week {current_week}")
+            logger.info(f"📊 Found {len(results)} KPI-Responsible combinations due for week {current_week}")
             return results
 
     except Exception as e:
-        print(f"❌ Error fetching due KPIs: {str(e)}")
+        logger.error(f"❌ Error fetching due KPIs: {str(e)}")
         traceback.print_exc()
         return []
     finally:
-        db_pool.putconn(conn)
+        return_db_connection(conn)
 
 def update_kpi_created_at(kpi_id):
-    """
-    Update created_at = NOW() to trigger recalculation of frequence_de_envoi
-    This will automatically calculate the next send date based on the frequency rule
-    """
-    conn = db_pool.getconn()
+    """Update created_at = NOW() to trigger recalculation of frequence_de_envoi"""
+    conn = None
     try:
+        conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -284,58 +304,53 @@ def update_kpi_created_at(kpi_id):
 
             if result:
                 kpi_id, kpi_name, new_created, new_freq = result
-                print(f"   ✅ Updated '{kpi_name}' (ID:{kpi_id})")
-                print(f"      New created_at: {new_created}")
-                print(f"      Next send scheduled: {new_freq}")
+                logger.info(f"   ✅ Updated '{kpi_name}' (ID:{kpi_id})")
+                logger.info(f"      New created_at: {new_created}")
+                logger.info(f"      Next send scheduled: {new_freq}")
                 return True
             else:
-                print(f"   ⚠️ KPI {kpi_id} not found for update")
+                logger.warning(f"   ⚠️ KPI {kpi_id} not found for update")
                 return False
 
     except Exception as e:
-        print(f"   ❌ Error updating KPI {kpi_id}: {str(e)}")
+        logger.error(f"   ❌ Error updating KPI {kpi_id}: {str(e)}")
         traceback.print_exc()
-        conn.rollback()
+        if conn:
+            conn.rollback()
         return False
     finally:
-        db_pool.putconn(conn)
+        return_db_connection(conn)
 
 def scheduled_email_task():
-    """
-    Main automated scheduler task:
-    1. Gets current ISO week
-    2. Finds all KPIs where frequence_de_envoi <= NOW()
-    3. Sends email to each responsible for their due KPIs
-    4. Updates created_at to trigger next cycle calculation
-    """
-    print(f"\n{'='*70}")
-    print(f"⏰ SCHEDULED TASK RUNNING at {datetime.now()}")
-    print(f"{'='*70}")
+    """Main automated scheduler task"""
+    logger.info("\n" + "="*70)
+    logger.info(f"⏰ SCHEDULED TASK RUNNING at {datetime.now(pytz.timezone('Africa/Tunis'))}")
+    logger.info("="*70)
 
     current_week = get_current_iso_week()
-    print(f"📅 Current ISO Week: {current_week}")
+    logger.info(f"📅 Current ISO Week: {current_week}")
 
     # Get all due KPIs with their responsibles
     due_records = get_due_kpis_with_responsibles()
 
     if not due_records:
-        print("ℹ️  No KPIs are due for sending at this time.")
-        print(f"{'='*70}\n")
+        logger.info("ℹ️  No KPIs are due for sending at this time.")
+        logger.info("="*70 + "\n")
         return
 
     kpis_processed = set()
     emails_sent = 0
     emails_failed = 0
 
-    print(f"\n📧 Processing {len(due_records)} KPI-Responsible combination(s):\n")
+    logger.info(f"\n📧 Processing {len(due_records)} KPI-Responsible combination(s):\n")
 
     # Send email to each responsible for their due KPIs
     for kpi_id, kpi_name, responsible_id, resp_name, email, week, plant_name in due_records:
-        print(f"📤 Sending KPI reminder:")
-        print(f"   KPI: {kpi_name} (ID: {kpi_id})")
-        print(f"   To: {resp_name} ({email})")
-        print(f"   Plant: {plant_name}")
-        print(f"   Week: {week}")
+        logger.info(f"📤 Sending KPI reminder:")
+        logger.info(f"   KPI: {kpi_name} (ID: {kpi_id})")
+        logger.info(f"   To: {resp_name} ({email})")
+        logger.info(f"   Plant: {plant_name}")
+        logger.info(f"   Week: {week}")
 
         try:
             success = send_kpi_email(responsible_id, resp_name, email, kpi_name, week, plant_name)
@@ -343,29 +358,29 @@ def scheduled_email_task():
             if success:
                 emails_sent += 1
                 kpis_processed.add(kpi_id)
-                print(f"   ✅ Email sent successfully\n")
+                logger.info(f"   ✅ Email sent successfully\n")
             else:
                 emails_failed += 1
-                print(f"   ❌ Email failed to send\n")
+                logger.info(f"   ❌ Email failed to send\n")
 
         except Exception as e:
             emails_failed += 1
-            print(f"   ❌ Exception: {str(e)}\n")
+            logger.error(f"   ❌ Exception: {str(e)}\n")
             traceback.print_exc()
 
     # Update KPIs to schedule next send
     if kpis_processed:
-        print(f"\n🔄 Updating {len(kpis_processed)} KPI(s) for next cycle:\n")
+        logger.info(f"\n🔄 Updating {len(kpis_processed)} KPI(s) for next cycle:\n")
 
         for kpi_id in kpis_processed:
             update_kpi_created_at(kpi_id)
 
-    print(f"\n{'='*70}")
-    print(f"✅ TASK COMPLETED:")
-    print(f"   📧 Emails sent: {emails_sent}")
-    print(f"   ❌ Emails failed: {emails_failed}")
-    print(f"   🔄 KPIs updated: {len(kpis_processed)}")
-    print(f"{'='*70}\n")
+    logger.info(f"\n{'='*70}")
+    logger.info(f"✅ TASK COMPLETED:")
+    logger.info(f"   📧 Emails sent: {emails_sent}")
+    logger.info(f"   ❌ Emails failed: {emails_failed}")
+    logger.info(f"   🔄 KPIs updated: {len(kpis_processed)}")
+    logger.info("="*70 + "\n")
 
 # ========================================
 # FLASK ROUTES
@@ -374,44 +389,74 @@ def scheduled_email_task():
 @app.route('/')
 def home():
     """Home page with system status"""
-    next_run = scheduler.get_jobs()[0].next_run_time if scheduler.get_jobs() else "Not scheduled"
+    try:
+        next_run = scheduler.get_jobs()[0].next_run_time if scheduler.get_jobs() else "Not scheduled"
+    except:
+        next_run = "Scheduler initializing..."
     
     return f'''
     <!DOCTYPE html>
     <html>
     <head>
         <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>KPI Automation System</title>
         <style>
-            body {{ font-family: 'Segoe UI', sans-serif; background: #f4f6f9; padding: 40px; }}
+            body {{ font-family: 'Segoe UI', sans-serif; background: #f4f6f9; padding: 20px; margin: 0; }}
             .container {{ max-width: 800px; margin: 0 auto; background: #fff; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-            h1 {{ color: #0078D7; }}
+            h1 {{ color: #0078D7; margin-bottom: 20px; }}
             .status {{ background: #e7f3ff; padding: 15px; border-radius: 5px; margin: 20px 0; border-left: 4px solid #0078D7; }}
             .info {{ margin: 10px 0; }}
             .label {{ font-weight: 600; color: #333; }}
             .button {{ display: inline-block; margin-top: 20px; padding: 12px 24px; background: #0078D7; color: white; text-decoration: none; border-radius: 6px; font-weight: 600; transition: background 0.2s; }}
             .button:hover {{ background: #005ea6; }}
+            .footer {{ margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee; font-size: 12px; color: #666; text-align: center; }}
         </style>
     </head>
     <body>
         <div class="container">
             <h1>🎯 KPI Automation System</h1>
             <div class="status">
-                <div class="info"><span class="label">Status:</span> ✅ Running</div>
+                <div class="info"><span class="label">Status:</span> ✅ Running on Azure</div>
                 <div class="info"><span class="label">Current Week:</span> {get_current_iso_week()}</div>
                 <div class="info"><span class="label">Next Scheduled Check:</span> {next_run}</div>
-                <div class="info"><span class="label">Server Time:</span> {datetime.now()}</div>
+                <div class="info"><span class="label">Server Time (Africa/Tunis):</span> {datetime.now(pytz.timezone('Africa/Tunis')).strftime('%Y-%m-%d %H:%M:%S')}</div>
+                <div class="info"><span class="label">Base URL:</span> {_base_url()}</div>
             </div>
             <p>The system automatically checks for due KPIs and sends email notifications to responsible parties based on the <code>frequence_de_envoi</code> schedule.</p>
             <a href="/dashboard" class="button">📊 View Dashboard</a>
+            <div class="footer">
+                Deployed on Azure Web App | Version 2.0
+            </div>
         </div>
     </body>
     </html>
     '''
 
+@app.route('/health')
+def health_check():
+    """Health check endpoint for Azure"""
+    try:
+        # Test database connection
+        conn = get_db_connection()
+        return_db_connection(conn)
+        
+        return {
+            'status': 'healthy',
+            'timestamp': datetime.now(pytz.timezone('Africa/Tunis')).isoformat(),
+            'database': 'connected',
+            'scheduler': 'active' if scheduler.running else 'inactive'
+        }, 200
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        return {
+            'status': 'unhealthy',
+            'error': str(e)
+        }, 500
+
 @app.route('/dashboard')
 def dashboard():
-    """Display KPI values dashboard with expanded text view"""
+    """Display KPI values dashboard"""
     try:
         kpi_data = get_all_kpi_values()
         
@@ -421,9 +466,10 @@ def dashboard():
             <html>
             <head>
                 <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <title>KPI Dashboard</title>
                 <style>
-                    body { font-family: 'Segoe UI', sans-serif; background: #f4f6f9; padding: 40px; }
+                    body { font-family: 'Segoe UI', sans-serif; background: #f4f6f9; padding: 20px; margin: 0; }
                     .container { max-width: 1200px; margin: 0 auto; background: #fff; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
                     h1 { color: #0078D7; }
                 </style>
@@ -441,9 +487,8 @@ def dashboard():
         # Generate table rows
         rows_html = ""
         for item in kpi_data:
-            # Escape HTML in text content
-            analyse_text = (item['analyse'] or 'N/A').replace('<', '&lt;').replace('>', '&gt;')
-            actions_text = (item['actions_correctives'] or 'N/A').replace('<', '&lt;').replace('>', '&gt;')
+            analyse_text = (item['analyse'] or 'N/A').replace('<', '&lt;').replace('>', '&gt;').replace('`', '&#96;')
+            actions_text = (item['actions_correctives'] or 'N/A').replace('<', '&lt;').replace('>', '&gt;').replace('`', '&#96;')
             
             rows_html += f'''
             <tr>
@@ -455,11 +500,11 @@ def dashboard():
                 <td>{item['week']}</td>
                 <td class="text-cell">
                     <div class="text-preview">{analyse_text[:100]}{'' if len(analyse_text) <= 100 else '...'}</div>
-                    <button class="view-btn" onclick="showFullText('Analyse - {item['kpi_name']}', `{analyse_text}`)">View Full</button>
+                    <button class="view-btn" onclick='showFullText("Analyse - {item['kpi_name']}", `{analyse_text}`)'>View Full</button>
                 </td>
                 <td class="text-cell">
                     <div class="text-preview">{actions_text[:100]}{'' if len(actions_text) <= 100 else '...'}</div>
-                    <button class="view-btn" onclick="showFullText('Actions Correctives - {item['kpi_name']}', `{actions_text}`)">View Full</button>
+                    <button class="view-btn" onclick='showFullText("Actions Correctives - {item['kpi_name']}", `{actions_text}`)'>View Full</button>
                 </td>
             </tr>
             '''
@@ -469,6 +514,7 @@ def dashboard():
         <html>
         <head>
             <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>KPI Dashboard</title>
             <style>
                 body {{
@@ -492,6 +538,8 @@ def dashboard():
                     margin-bottom: 30px;
                     padding-bottom: 20px;
                     border-bottom: 2px solid #0078D7;
+                    flex-wrap: wrap;
+                    gap: 15px;
                 }}
                 h1 {{
                     color: #0078D7;
@@ -585,7 +633,7 @@ def dashboard():
                     margin: 5% auto;
                     padding: 30px;
                     border-radius: 10px;
-                    width: 80%;
+                    width: 90%;
                     max-width: 800px;
                     max-height: 70vh;
                     overflow-y: auto;
@@ -617,6 +665,15 @@ def dashboard():
                     white-space: pre-wrap;
                     line-height: 1.6;
                     color: #333;
+                }}
+                
+                @media (max-width: 768px) {{
+                    .container {{
+                        padding: 15px;
+                    }}
+                    .header {{
+                        flex-direction: column;
+                    }}
                 }}
             </style>
         </head>
@@ -680,37 +737,60 @@ def dashboard():
                         modal.style.display = 'none';
                     }}
                 }}
+                
+                // Close modal on escape key
+                document.addEventListener('keydown', function(event) {{
+                    if (event.key === 'Escape') {{
+                        closeModal();
+                    }}
+                }});
             </script>
         </body>
         </html>
         '''
         
     except Exception as e:
-        print(f"❌ Error in dashboard: {str(e)}")
+        logger.error(f"❌ Error in dashboard: {str(e)}")
         traceback.print_exc()
         return f'<p style="color:red; padding: 20px;">Error loading dashboard: {str(e)}</p>'
 
 @app.route('/form')
 def form_page():
-    """Display KPI form with plant name"""
+    """Display KPI form"""
     try:
         responsible_id = request.args.get('responsible_id')
         week = request.args.get('week', get_current_iso_week())
 
-        print(f"📋 Form accessed - Responsible: {responsible_id}, Week: {week}")
+        logger.info(f"📋 Form accessed - Responsible: {responsible_id}, Week: {week}")
 
         data = get_responsible_with_kpis(responsible_id, week)
         responsible = data['responsible']
         kpis = data['kpis']
 
-        print(f"📋 Data loaded - Responsible: {responsible['name']}, Plant: {responsible['plant_name']}, KPIs: {len(kpis)}")
+        logger.info(f"📋 Data loaded - Responsible: {responsible['name']}, Plant: {responsible['plant_name']}, KPIs: {len(kpis)}")
 
         if not kpis:
             return '''
-            <div style="font-family: Arial; padding: 40px; text-align: center;">
-                <h2>ℹ️ No KPIs Found</h2>
-                <p>There are no KPIs assigned for this week.</p>
-            </div>
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>No KPIs Found</title>
+                <style>
+                    body { font-family: Arial; padding: 40px; text-align: center; background: #f4f6f9; }
+                    .message { background: white; padding: 40px; border-radius: 10px; max-width: 500px; margin: 0 auto; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                    h2 { color: #0078D7; }
+                </style>
+            </head>
+            <body>
+                <div class="message">
+                    <h2>ℹ️ No KPIs Found</h2>
+                    <p>There are no KPIs assigned for this week.</p>
+                    <a href="/" style="color: #0078D7; text-decoration: none; font-weight: 600;">← Back to Home</a>
+                </div>
+            </body>
+            </html>
             '''
 
         kpi_html = ""
@@ -734,12 +814,12 @@ def form_page():
 
                 <div class="form-group">
                     <label class="form-label">Analysis: <span style="color:#999;font-weight:normal;font-size:12px;">(Provide detailed analysis)</span></label>
-                    <textarea name="analyse_{kpi['kpi_values_id']}" placeholder="Enter your detailed analysis here..." class="kpi-textarea-large">{kpi['analyse'] or ''}</textarea>
+                    <textarea name="analyse_{kpi['kpi_values_id']}" placeholder="Enter your detailed analysis here..." class="kpi-textarea-large" required>{kpi['analyse'] or ''}</textarea>
                 </div>
 
                 <div class="form-group">
                     <label class="form-label">Corrective Actions: <span style="color:#999;font-weight:normal;font-size:12px;">(Provide detailed corrective actions)</span></label>
-                    <textarea name="actions_{kpi['kpi_values_id']}" placeholder="Enter detailed corrective actions here..." class="kpi-textarea-large">{kpi['actions_correctives'] or ''}</textarea>
+                    <textarea name="actions_{kpi['kpi_values_id']}" placeholder="Enter detailed corrective actions here..." class="kpi-textarea-large" required>{kpi['actions_correctives'] or ''}</textarea>
                 </div>
             </div>
             '''
@@ -749,6 +829,7 @@ def form_page():
         <html>
         <head>
             <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>KPI Form - Week {week}</title>
             <style>
                 body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f6f9; padding: 20px; margin: 0; }}
@@ -758,9 +839,9 @@ def form_page():
                 .header .subtitle {{ margin-top: 8px; font-size: 14px; opacity: 0.9; }}
                 .form-section {{ padding: 30px; }}
                 .info-section {{ background: #f8f9fa; padding: 20px; border-radius: 6px; margin-bottom: 25px; border-left: 4px solid #0078D7; }}
-                .info-row {{ display: flex; margin-bottom: 15px; align-items: center; }}
+                .info-row {{ display: flex; margin-bottom: 15px; align-items: center; flex-wrap: wrap; }}
                 .info-label {{ font-weight: 600; color: #333; width: 140px; font-size: 14px; }}
-                .info-value {{ flex: 1; padding: 10px 12px; background: white; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }}
+                .info-value {{ flex: 1; padding: 10px 12px; background: white; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; min-width: 200px; }}
                 .kpi-section {{ margin-top: 30px; }}
                 .kpi-section h3 {{ color: #0078D7; margin-bottom: 20px; font-size: 20px; border-bottom: 2px solid #0078D7; padding-bottom: 10px; }}
                 .kpi-card {{ background: #fff; border: 1px solid #e1e5e9; border-radius: 6px; padding: 25px; margin-bottom: 25px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }}
@@ -772,9 +853,17 @@ def form_page():
                 .kpi-input:focus, .kpi-textarea:focus, .kpi-textarea-large:focus {{ border-color: #0078D7; outline: none; box-shadow: 0 0 0 2px rgba(0,120,215,0.1); }}
                 .submit-btn {{ background: #0078D7; color: white; border: none; padding: 14px 30px; border-radius: 4px; font-size: 16px; font-weight: 600; cursor: pointer; transition: background-color 0.2s; display: block; width: 100%; margin-top: 20px; }}
                 .submit-btn:hover {{ background: #005ea6; }}
+                .submit-btn:disabled {{ background: #ccc; cursor: not-allowed; }}
                 .dashboard-btn {{ background: #28a745; color: white; border: none; padding: 14px 30px; border-radius: 4px; font-size: 16px; font-weight: 600; cursor: pointer; transition: background-color 0.2s; display: block; width: 100%; margin-top: 10px; text-decoration: none; text-align: center; }}
                 .dashboard-btn:hover {{ background: #218838; }}
                 .char-counter {{ font-size: 12px; color: #666; margin-top: 4px; text-align: right; }}
+                
+                @media (max-width: 768px) {{
+                    .container {{ margin: 0; border-radius: 0; }}
+                    .form-section {{ padding: 15px; }}
+                    .info-row {{ flex-direction: column; align-items: stretch; }}
+                    .info-label {{ width: 100%; margin-bottom: 5px; }}
+                }}
             </style>
         </head>
         <body>
@@ -793,15 +882,19 @@ def form_page():
                             <div class="info-label">Plant:</div>
                             <div class="info-value">{responsible['plant_name']}</div>
                         </div>
+                        <div class="info-row">
+                            <div class="info-label">Week:</div>
+                            <div class="info-value">{week}</div>
+                        </div>
                     </div>
 
                     <div class="kpi-section">
                         <h3>Your KPIs</h3>
-                        <form action="/submit" method="POST">
+                        <form action="/submit" method="POST" id="kpiForm">
                             <input type="hidden" name="responsible_id" value="{responsible_id}" />
                             <input type="hidden" name="week" value="{week}" />
                             {kpi_html}
-                            <button type="submit" class="submit-btn">📤 Submit KPI Report</button>
+                            <button type="submit" class="submit-btn" id="submitBtn">📤 Submit KPI Report</button>
                         </form>
                     </div>
                 </div>
@@ -821,24 +914,33 @@ def form_page():
                             counter.textContent = this.value.length + ' characters';
                         }});
                     }});
+                    
+                    // Form validation
+                    const form = document.getElementById('kpiForm');
+                    form.addEventListener('submit', function(e) {{
+                        const submitBtn = document.getElementById('submitBtn');
+                        submitBtn.disabled = true;
+                        submitBtn.textContent = '⏳ Submitting...';
+                    }});
                 }});
             </script>
         </body>
         </html>
         '''
     except Exception as e:
-        print(f"❌ Error in form_page: {str(e)}")
+        logger.error(f"❌ Error in form_page: {str(e)}")
         traceback.print_exc()
         return f'<p style="color:red; padding: 20px;">Error loading form: {str(e)}</p>'
 
 @app.route('/submit', methods=['POST'])
 def submit_form():
     """Handle form submission"""
+    conn = None
     try:
         responsible_id = request.form.get('responsible_id')
         week = request.form.get('week')
 
-        print(f"📝 Form submission - Responsible: {responsible_id}, Week: {week}")
+        logger.info(f"📝 Form submission - Responsible: {responsible_id}, Week: {week}")
 
         # Collect analyse_* and actions_* fields
         kpi_data = {}
@@ -852,13 +954,29 @@ def submit_form():
 
         if not kpi_data:
             return '''
-            <div style="font-family: Arial; padding: 40px; text-align: center;">
-                <h2 style="color:#e67e22;">ℹ️ Nothing to Update</h2>
-                <p>No analysis or corrective actions were provided.</p>
-            </div>
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Nothing to Update</title>
+                <style>
+                    body { font-family: Arial; padding: 40px; text-align: center; background: #f4f6f9; }
+                    .message { background: white; padding: 40px; border-radius: 10px; max-width: 500px; margin: 0 auto; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                    h2 { color: #e67e22; }
+                </style>
+            </head>
+            <body>
+                <div class="message">
+                    <h2>ℹ️ Nothing to Update</h2>
+                    <p>No analysis or corrective actions were provided.</p>
+                    <a href="/" style="color: #0078D7; text-decoration: none; font-weight: 600;">← Back to Home</a>
+                </div>
+            </body>
+            </html>
             ''', 200
 
-        conn = db_pool.getconn()
+        conn = get_db_connection()
         try:
             with conn.cursor() as cur:
                 for kpi_values_id, data in kpi_data.items():
@@ -884,24 +1002,25 @@ def submit_form():
                     )
 
             conn.commit()
-            print(f"✅ Successfully updated {len(kpi_data)} KPI value(s)")
+            logger.info(f"✅ Successfully updated {len(kpi_data)} KPI value(s)")
 
             return f'''
             <!DOCTYPE html>
             <html>
             <head>
                 <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <title>Submission Successful</title>
                 <style>
                     body {{
                         font-family:'Segoe UI',sans-serif; background:#f4f4f4;
                         display:flex; justify-content:center; align-items:center;
-                        height:100vh; margin:0;
+                        min-height:100vh; margin:0; padding: 20px;
                     }}
                     .success-container {{
                         background:#fff; padding:50px; border-radius:10px;
                         box-shadow:0 4px 15px rgba(0,0,0,0.1); text-align:center;
-                        max-width: 550px;
+                        max-width: 550px; width: 100%;
                     }}
                     .success-icon {{ font-size: 64px; margin-bottom: 20px; }}
                     h1 {{ color:#28a745; font-size:28px; margin-bottom:20px; }}
@@ -929,13 +1048,91 @@ def submit_form():
             </body>
             </html>
             '''
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            raise
         finally:
-            db_pool.putconn(conn)
+            return_db_connection(conn)
 
     except Exception as e:
-        print(f"❌ Error in submit_form: {str(e)}")
+        logger.error(f"❌ Error in submit_form: {str(e)}")
         traceback.print_exc()
         return f'<h2 style="color:red; padding: 20px;">❌ Failed to submit KPI values</h2><p>{str(e)}</p>', 500
+
+@app.route('/trigger-task')
+def trigger_task():
+    """Manual trigger for scheduled task - useful for testing"""
+    try:
+        scheduled_email_task()
+        return {
+            'status': 'success',
+            'message': 'Scheduled task executed manually',
+            'timestamp': datetime.now(pytz.timezone('Africa/Tunis')).isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error triggering task: {str(e)}")
+        return {
+            'status': 'error',
+            'message': str(e)
+        }, 500
+
+# ========================================
+# ERROR HANDLERS
+# ========================================
+
+@app.errorhandler(404)
+def not_found(e):
+    return '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Page Not Found</title>
+        <style>
+            body { font-family: 'Segoe UI', sans-serif; background: #f4f6f9; padding: 40px; text-align: center; }
+            .error-container { background: white; padding: 50px; border-radius: 10px; max-width: 500px; margin: 0 auto; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            h1 { color: #e74c3c; }
+            a { color: #0078D7; text-decoration: none; font-weight: 600; }
+        </style>
+    </head>
+    <body>
+        <div class="error-container">
+            <h1>404 - Page Not Found</h1>
+            <p>The page you're looking for doesn't exist.</p>
+            <a href="/">← Back to Home</a>
+        </div>
+    </body>
+    </html>
+    ''', 404
+
+@app.errorhandler(500)
+def internal_error(e):
+    logger.error(f"Internal server error: {str(e)}")
+    return '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Server Error</title>
+        <style>
+            body { font-family: 'Segoe UI', sans-serif; background: #f4f6f9; padding: 40px; text-align: center; }
+            .error-container { background: white; padding: 50px; border-radius: 10px; max-width: 500px; margin: 0 auto; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            h1 { color: #e74c3c; }
+            a { color: #0078D7; text-decoration: none; font-weight: 600; }
+        </style>
+    </head>
+    <body>
+        <div class="error-container">
+            <h1>500 - Server Error</h1>
+            <p>Something went wrong. Please try again later.</p>
+            <a href="/">← Back to Home</a>
+        </div>
+    </body>
+    </html>
+    ''', 500
 
 # ========================================
 # INITIALIZE SCHEDULER
@@ -946,21 +1143,22 @@ scheduler.add_job(
     scheduled_email_task,
     'cron',
     hour=16,
-    minute=00,
+    minute=0,
     timezone=pytz.timezone('Africa/Tunis'),
     id='kpi_email_scheduler',
     name='KPI Automated Email Scheduler'
 )
 scheduler.start()
 
-print("\n" + "="*70)
-print("✅ KPI AUTOMATION SYSTEM INITIALIZED")
-print("="*70)
-print(f"📅 Scheduler: Active")
-print(f"⏰ Schedule: Daily at 9:00 AM (Africa/Tunis)")
-print(f"📧 Next run: {scheduler.get_jobs()[0].next_run_time}")
-print(f"🌐 Server: Running on port {PORT}")
-print("="*70 + "\n")
+logger.info("\n" + "="*70)
+logger.info("✅ KPI AUTOMATION SYSTEM INITIALIZED")
+logger.info("="*70)
+logger.info(f"📅 Scheduler: Active")
+logger.info(f"⏰ Schedule: Daily at 16:00 (Africa/Tunis)")
+logger.info(f"📧 Next run: {scheduler.get_jobs()[0].next_run_time}")
+logger.info(f"🌐 Server: Running on port {PORT}")
+logger.info(f"🔗 Base URL: {_base_url()}")
+logger.info("="*70 + "\n")
 
 # ========================================
 # START SERVER
@@ -968,16 +1166,18 @@ print("="*70 + "\n")
 
 if __name__ == '__main__':
     try:
-        print(f"🔗 Access points:")
-        print(f"   - Home: http://localhost:{PORT}/")
-        print(f"   - Dashboard: http://localhost:{PORT}/dashboard")
-        print(f"   - Form: http://localhost:{PORT}/form?responsible_id=1&week=2025-W44")
-        print("\n" + "="*70 + "\n")
-        app.run(host='0.0.0.0', port=PORT, debug=False)
+        logger.info(f"🔗 Access points:")
+        logger.info(f"   - Home: {_base_url()}/")
+        logger.info(f"   - Dashboard: {_base_url()}/dashboard")
+        logger.info(f"   - Health Check: {_base_url()}/health")
+        logger.info("\n" + "="*70 + "\n")
+        
+        # Use 0.0.0.0 for Azure, debug=False for production
+        app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
     except KeyboardInterrupt:
-        print("\n🛑 Server stopped by user")
+        logger.info("\n🛑 Server stopped by user")
     finally:
-        db_pool.closeall()
+        if db_pool:
+            db_pool.closeall()
         scheduler.shutdown()
-        print("✅ Cleanup complete")
-
+        logger.info("✅ Cleanup complete")
