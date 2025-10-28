@@ -945,8 +945,8 @@ scheduler = BackgroundScheduler(timezone=pytz.timezone('Africa/Tunis'))
 scheduler.add_job(
     scheduled_email_task,
     'cron',
-    hour=12,
-    minute=40,
+    hour=13,
+    minute=56,
     timezone=pytz.timezone('Africa/Tunis'),
     id='kpi_email_scheduler',
     name='KPI Automated Email Scheduler'
