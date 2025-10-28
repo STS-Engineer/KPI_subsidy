@@ -1143,7 +1143,7 @@ scheduler.add_job(
     scheduled_email_task,
     'cron',
     hour=16,
-    minute=0,
+    minute=15,
     timezone=pytz.timezone('Africa/Tunis'),
     id='kpi_email_scheduler',
     name='KPI Automated Email Scheduler'
