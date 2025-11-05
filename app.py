@@ -482,7 +482,19 @@ def scheduler_status():
     
     current_time = datetime.now(pytz.timezone('Africa/Tunis'))
     
-    return f'''
+    # Build jobs HTML separately to avoid f-string nesting issues
+    jobs_html = ""
+    for job in jobs_info:
+        jobs_html += f"""
+        <div class="job">
+            <div><span class="label">Job ID:</span> {job['id']}</div>
+            <div><span class="label">Name:</span> {job['name']}</div>
+            <div><span class="label">Next Run:</span> {job['next_run']}</div>
+            <div><span class="label">Trigger:</span> {job['trigger']}</div>
+        </div>
+        """
+    
+    return f"""
     <!DOCTYPE html>
     <html>
     <head>
@@ -514,14 +526,7 @@ def scheduler_status():
             </div>
             
             <h2>📋 Scheduled Jobs</h2>
-            {''.join([f'''
-            <div class="job">
-                <div><span class="label">Job ID:</span> {job['id']}</div>
-                <div><span class="label">Name:</span> {job['name']}</div>
-                <div><span class="label">Next Run:</span> {job['next_run']}</div>
-                <div><span class="label">Trigger:</span> {job['trigger']}</div>
-            </div>
-            ''' for job in jobs_info])}
+            {jobs_html}
             
             <h2>🧪 Test Functions</h2>
             <a href="/test-email-task" class="button test-btn">🧪 Run Email Task Manually</a>
@@ -530,7 +535,7 @@ def scheduler_status():
         </div>
     </body>
     </html>
-    '''
+    """
 
 @app.route('/test-email-task')
 def test_email_task():
@@ -567,7 +572,7 @@ def test_due_kpis():
         records_html = ""
         if due_records:
             for kpi_id, kpi_name, responsible_id, resp_name, email, week, plant_name, plant_id in due_records:
-                records_html += f'''
+                records_html += f"""
                 <div style="background: #f8f9fa; padding: 15px; margin: 10px 0; border-radius: 5px; border-left: 4px solid #0078D7;">
                     <div><strong>KPI:</strong> {kpi_name} (ID: {kpi_id})</div>
                     <div><strong>Responsible:</strong> {resp_name} (ID: {responsible_id})</div>
@@ -575,11 +580,11 @@ def test_due_kpis():
                     <div><strong>Plant:</strong> {plant_name} (ID: {plant_id})</div>
                     <div><strong>Week:</strong> {week}</div>
                 </div>
-                '''
+                """
         else:
             records_html = '<p style="color: #666;">No KPIs are currently due.</p>'
         
-        return f'''
+        return f"""
         <!DOCTYPE html>
         <html>
         <head>
@@ -610,15 +615,15 @@ def test_due_kpis():
             </div>
         </body>
         </html>
-        '''
+        """
     except Exception as e:
-        return f'''
+        return f"""
         <div style="font-family: Arial; padding: 40px; text-align: center;">
             <h2 style="color: #dc3545;">❌ Error</h2>
             <p>{str(e)}</p>
             <pre style="text-align: left; background: #f4f4f4; padding: 15px; border-radius: 5px;">{traceback.format_exc()}</pre>
         </div>
-        '''
+        """
 
 @app.route('/form')
 def form_page():
@@ -660,7 +665,7 @@ def form_page():
 
         kpi_html = ""
         for kpi in kpis:
-            kpi_html += f'''
+            kpi_html += f"""
             <div class="kpi-card">
                 <div class="form-group">
                     <label class="form-label">KPI Name:</label>
@@ -687,9 +692,9 @@ def form_page():
                     <textarea name="actions_{kpi['kpi_values_id']}" placeholder="Enter detailed corrective actions here..." class="kpi-textarea-large">{kpi['actions_correctives'] or ''}</textarea>
                 </div>
             </div>
-            '''
+            """
 
-        return f'''
+        return f"""
         <!DOCTYPE html>
         <html>
         <head>
@@ -775,7 +780,7 @@ def form_page():
             </script>
         </body>
         </html>
-        '''
+        """
     except Exception as e:
         print(f"❌ Error in form_page: {str(e)}")
         traceback.print_exc()
@@ -842,7 +847,7 @@ def submit_form():
             if plant_id:
                 form_url += f"&plant_id={plant_id}"
 
-            return f'''
+            return f"""
             <!DOCTYPE html>
             <html>
             <head>
@@ -884,7 +889,7 @@ def submit_form():
                 </div>
             </body>
             </html>
-            '''
+            """
         finally:
             db_pool.putconn(conn)
 
@@ -902,7 +907,7 @@ scheduler.add_job(
     scheduled_email_task,
     'cron',
     hour=8,
-    minute=00,
+    minute=0,
     timezone=pytz.timezone('Africa/Tunis'),
     id='kpi_email_scheduler',
     name='KPI Automated Email Scheduler (Plant-based)'
@@ -913,7 +918,7 @@ print("\n" + "="*70)
 print("✅ KPI AUTOMATION SYSTEM INITIALIZED (PLANT-BASED EMAILS)")
 print("="*70)
 print(f"📅 Scheduler: Active")
-print(f"⏰ Schedule: Daily at 07:05 AM (Africa/Tunis)")
+print(f"⏰ Schedule: Daily at 08:00 AM (Africa/Tunis)")
 print(f"📧 Next run: {scheduler.get_jobs()[0].next_run_time}")
 print(f"🌐 Server: Running on port {PORT}")
 print(f"🏭 Mode: One email per plant (grouped KPIs)")
