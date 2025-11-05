@@ -47,7 +47,7 @@ def _base_url():
             return request.host_url.rstrip('/')
     except RuntimeError:
         pass
-    return os.getenv('APP_BASE_URL', f'https://kpi-subsidy.azurewebsites.net/:{PORT}')
+    return os.getenv('APP_BASE_URL', 'https://kpi-subsidy.azurewebsites.net')
 
 def get_current_iso_week():
     """Get current ISO week in format YYYY-Wxx (e.g., 2025-W43)"""
@@ -907,7 +907,7 @@ scheduler.add_job(
     scheduled_email_task,
     'cron',
     hour=9,
-    minute=40,
+    minute=53,
     timezone=pytz.timezone('Africa/Tunis'),
     id='kpi_email_scheduler',
     name='KPI Automated Email Scheduler (Plant-based)'
