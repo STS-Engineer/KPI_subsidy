@@ -907,7 +907,7 @@ scheduler.add_job(
     scheduled_email_task,
     'cron',
     hour=9,
-    minute=0,
+    minute=12,
     timezone=pytz.timezone('Africa/Tunis'),
     id='kpi_email_scheduler',
     name='KPI Automated Email Scheduler (Plant-based)'
