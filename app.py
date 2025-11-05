@@ -47,7 +47,7 @@ def _base_url():
             return request.host_url.rstrip('/')
     except RuntimeError:
         pass
-    return os.getenv('APP_BASE_URL', f'http://localhost:{PORT}')
+    return os.getenv('APP_BASE_URL', f'https://kpi-subsidy.azurewebsites.net/:{PORT}')
 
 def get_current_iso_week():
     """Get current ISO week in format YYYY-Wxx (e.g., 2025-W43)"""
